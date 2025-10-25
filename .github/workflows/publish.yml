@@ -1,0 +1,120 @@
+name: Push Changes to Public Repo
+
+on:
+    # Manual trigger
+    workflow_dispatch:
+
+        # Optional input for commit message
+        # Removing, as automatic default may be preferable
+        # inputs:
+        #     message:
+        #         description: "Publish commit message (optional)"
+        #         required: false
+        #         type: string
+
+    # Trigger upon push to public branch in private repo
+    # push:
+    #     branches:
+    #         - main
+
+permissions:
+    contents: read
+
+jobs:
+    publish:
+        runs-on: ubuntu-latest
+        defaults:
+            run:
+                # Makes scripts more robust by exiting on errors, unset variables, and failed pipes
+                shell: bash
+
+        steps:
+            - name: Checkout r3cap-dev/main (private)
+              uses: actions/checkout@v4
+              with:
+                  # Full history to get tree, could possibly be changed to 1 or 2 after testing
+                  fetch-depth: 0
+                  ref: main
+                  lfs: true
+                  persist-credentials: false  # We'll use PAT later
+
+            - name: Setup git author to be GitHub actions bot
+              uses: qoomon/actions--setup-git@v1
+              with:
+                user: bot
+
+            - name: Configure HTTPS auth header for PAT (scoped to public repo)
+              env:
+                  # TODO: Needs replacement in `Secrets` yearly, or preferably solve #453
+                  GH_PAT: ${{ secrets.PUBLIC_REPO_PAT }}
+              run: |
+                  git config --global http.https://github.com/singaporetech/r3cap.git.extraheader "AUTHORIZATION: basic $(printf "x-access-token:%s" "$GH_PAT" | base64 -w0)"
+
+            - name: Add destination remote (singaporetech/r3cap) and fetch
+              run: |
+                  git remote remove public 2>/dev/null || true
+                  git remote add public https://github.com/singaporetech/r3cap.git
+                  git fetch --no-tags --prune public +refs/heads/main:refs/remotes/public/main
+
+            - name: Determine base ref
+              id: base
+              run: |
+                  if git rev-parse --verify -q origin/main >/dev/null; then
+                      echo "ref=origin/main" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "ref=main" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Create squashed commit object (private tree + public parent)
+              env:
+                  MESSAGE_INPUT: ${{ github.event.inputs.message }}
+              run: |
+                  # Checkout the public parent as the base for the export branch
+                  git checkout -q -B public-export public/main
+
+                  # Use the tree from the chosen base ref (private main)
+                  BASE_REF="${{ steps.base.outputs.ref }}"
+                  TREE=$(git rev-parse "$BASE_REF^{tree}")
+
+                  PARENT=$(git rev-parse public/main)
+
+                  DEFAULT_MSG="Update: sync from private main (${GITHUB_SHA::7})"
+                  COMMIT_MSG="${MESSAGE_INPUT:-$DEFAULT_MSG}"
+
+                  NEW=$(git commit-tree "$TREE" -p "$PARENT" -m "$COMMIT_MSG")
+                  git reset --hard "$NEW"
+
+            - name: Remove workflows from export commit (post-commit cleanup)
+              run: |
+                  set -euo pipefail
+                  git checkout -q public-export
+
+                  # Remove from index (and working tree) if present
+                  git rm -r --cached --ignore-unmatch .github/workflows || true
+                  rm -rf .github/workflows || true
+
+                  # Optional: remove entire .github directory instead of only workflows
+                  # git rm -r --cached --ignore-unmatch .github || true
+                  # rm -rf .github || true
+
+                  # Commit only if there are staged deletions
+                  if ! git diff --quiet --cached; then
+                      git commit -m "chore: strip workflows from public export"
+                  else
+                      echo "No workflow files present to remove."
+                  fi
+
+                  # Final verification to ensure no workflow files remain
+                  if git ls-tree -r --name-only HEAD | grep -E '^\.github/workflows(/|$)' >/dev/null; then
+                      echo "Error: workflow files still present in export commit" >&2
+                      git ls-tree -r --name-only HEAD | grep -E '^\.github/workflows' || true
+                      exit 1
+                  fi
+
+            - name: Push to destination main (append, no force)
+              run: |
+                  git push public public-export:main
+
+            - name: Summary
+              run: |
+                  echo "Published append commit(s) to singaporetech/r3cap@main" >> $GITHUB_STEP_SUMMARY
